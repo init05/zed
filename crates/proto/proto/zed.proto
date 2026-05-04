@@ -481,7 +481,9 @@ message Envelope {
     GitRestoreArchiveCheckpoint git_restore_archive_checkpoint = 446;
     GetCommitData get_commit_data = 447;
     GetCommitDataResponse get_commit_data_response = 448;
-    GitPruneWorktrees git_prune_worktrees = 449; // current max
+    SearchCommits search_commits = 449;
+    SearchCommitsResponse search_commits_response = 450;
+    GitPruneWorktrees git_prune_worktrees = 451; // current max
   }
 
   reserved 87 to 88;
