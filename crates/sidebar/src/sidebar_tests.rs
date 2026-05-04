@@ -5109,6 +5109,7 @@ async fn test_restore_worktree_when_branch_has_moved(cx: &mut TestAppContext) {
                     original_commit_hash: "original-sha".to_string(),
                 },
                 None,
+                agent_ui::thread_worktree_archive::OverwritePolicy::Overwrite,
                 &mut cx,
             )
             .await
@@ -5218,6 +5219,7 @@ async fn test_restore_worktree_when_branch_has_not_moved(cx: &mut TestAppContext
                     original_commit_hash: "original-sha".to_string(),
                 },
                 None,
+                agent_ui::thread_worktree_archive::OverwritePolicy::Overwrite,
                 &mut cx,
             )
             .await
@@ -5319,6 +5321,7 @@ async fn test_restore_worktree_when_branch_does_not_exist(cx: &mut TestAppContex
                     original_commit_hash: "original-sha".to_string(),
                 },
                 None,
+                agent_ui::thread_worktree_archive::OverwritePolicy::Overwrite,
                 &mut cx,
             )
             .await

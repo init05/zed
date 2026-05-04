@@ -2819,15 +2819,21 @@ impl Sidebar {
                 }
 
                 let mut path_replacements: Vec<(PathBuf, PathBuf)> = Vec::new();
-                for row in &archived_worktrees {
+                let mut needs_confirmation: Vec<usize> = Vec::new();
+
+                // First pass: restore worktrees whose paths are clean (don't
+                // exist or are empty), and collect those whose paths have
+                // existing content that the restore would clobber.
+                for (index, row) in archived_worktrees.iter().enumerate() {
                     match thread_worktree_archive::restore_worktree_via_git(
                         row,
                         metadata.remote_connection.as_ref(),
+                        thread_worktree_archive::OverwritePolicy::Refuse,
                         &mut *cx,
                     )
                     .await
                     {
-                        Ok(restored_path) => {
+                        Ok(thread_worktree_archive::RestoreOutcome::Restored(restored_path)) => {
                             thread_worktree_archive::cleanup_archived_worktree_record(
                                 row,
                                 metadata.remote_connection.as_ref(),
@@ -2835,6 +2841,9 @@ impl Sidebar {
                             )
                             .await;
                             path_replacements.push((row.worktree_path.clone(), restored_path));
+                        }
+                        Ok(thread_worktree_archive::RestoreOutcome::WouldOverwrite { .. }) => {
+                            needs_confirmation.push(index);
                         }
                         Err(error) => {
                             log::error!("Failed to restore worktree: {error:#}");
@@ -2866,6 +2875,137 @@ impl Sidebar {
                             })
                             .ok();
                             return anyhow::Ok(());
+                        }
+                    }
+                }
+
+                // If any paths have existing content, prompt the user before
+                // clobbering them. The restore unconditionally runs
+                // `git read-tree --reset -u` later, so any pre-existing
+                // content at the worktree path — user files, leftovers from a
+                // partial archive, or even uncommitted work in a still-valid
+                // worktree — will be destroyed.
+                if !needs_confirmation.is_empty() {
+                    let paths_for_prompt: Vec<String> = needs_confirmation
+                        .iter()
+                        .map(|&i| {
+                            archived_worktrees[i]
+                                .worktree_path
+                                .display()
+                                .to_string()
+                        })
+                        .collect();
+                    let prompt_message = if paths_for_prompt.len() == 1 {
+                        format!(
+                            "Restoring this thread will overwrite the existing contents of:\n\n{}\n\nContinue?",
+                            paths_for_prompt[0]
+                        )
+                    } else {
+                        format!(
+                            "Restoring this thread will overwrite the existing contents of:\n\n{}\n\nContinue?",
+                            paths_for_prompt.join("\n")
+                        )
+                    };
+                    let answer = cx
+                        .prompt(
+                            gpui::PromptLevel::Warning,
+                            &prompt_message,
+                            None,
+                            &["Overwrite", "Cancel"],
+                        )
+                        .await
+                        .ok();
+
+                    if answer != Some(0) {
+                        // User canceled. Bail out without restoring further; any
+                        // already-restored worktrees from the first pass remain
+                        // restored, but no destructive changes have been made
+                        // for the dirty paths.
+                        this.update_in(cx, |this, _window, cx| {
+                            this.restoring_tasks.remove(&thread_id);
+                            if let Some(weak_archive_view) = &weak_archive_view {
+                                weak_archive_view
+                                    .update(cx, |view, cx| {
+                                        view.clear_restoring(&thread_id, cx);
+                                    })
+                                    .ok();
+                            }
+                        })
+                        .ok();
+                        return anyhow::Ok(());
+                    }
+
+                    // Second pass: user confirmed, so do the destructive
+                    // restores for the paths that needed confirmation.
+                    for index in needs_confirmation {
+                        let row = &archived_worktrees[index];
+                        match thread_worktree_archive::restore_worktree_via_git(
+                            row,
+                            metadata.remote_connection.as_ref(),
+                            thread_worktree_archive::OverwritePolicy::Overwrite,
+                            &mut *cx,
+                        )
+                        .await
+                        {
+                            Ok(thread_worktree_archive::RestoreOutcome::Restored(
+                                restored_path,
+                            )) => {
+                                thread_worktree_archive::cleanup_archived_worktree_record(
+                                    row,
+                                    metadata.remote_connection.as_ref(),
+                                    &mut *cx,
+                                )
+                                .await;
+                                path_replacements
+                                    .push((row.worktree_path.clone(), restored_path));
+                            }
+                            Ok(thread_worktree_archive::RestoreOutcome::WouldOverwrite {
+                                ..
+                            }) => {
+                                // Should not happen with Overwrite policy, but
+                                // guard against it just in case.
+                                log::error!(
+                                    "restore_worktree_via_git unexpectedly returned \
+                                     WouldOverwrite under OverwritePolicy::Overwrite"
+                                );
+                            }
+                            Err(error) => {
+                                log::error!("Failed to restore worktree: {error:#}");
+                                this.update_in(cx, |this, _window, cx| {
+                                    this.restoring_tasks.remove(&thread_id);
+                                    if let Some(weak_archive_view) = &weak_archive_view {
+                                        weak_archive_view
+                                            .update(cx, |view, cx| {
+                                                view.clear_restoring(&thread_id, cx);
+                                            })
+                                            .ok();
+                                    }
+
+                                    if let Some(multi_workspace) = this.multi_workspace.upgrade()
+                                    {
+                                        let workspace =
+                                            multi_workspace.read(cx).workspace().clone();
+                                        workspace.update(cx, |workspace, cx| {
+                                            struct RestoreWorktreeErrorToast;
+                                            workspace.show_toast(
+                                                Toast::new(
+                                                    NotificationId::unique::<
+                                                        RestoreWorktreeErrorToast,
+                                                    >(
+                                                    ),
+                                                    format!(
+                                                        "Failed to restore worktree: {error:#}"
+                                                    ),
+                                                )
+                                                .autohide(),
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                })
+                                .ok();
+                                return anyhow::Ok(());
+                            }
                         }
                     }
                 }

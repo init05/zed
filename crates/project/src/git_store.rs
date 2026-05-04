@@ -675,6 +675,7 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_get_worktrees);
         client.add_entity_request_handler(Self::handle_create_worktree);
         client.add_entity_request_handler(Self::handle_remove_worktree);
+        client.add_entity_request_handler(Self::handle_prune_worktrees);
         client.add_entity_request_handler(Self::handle_rename_worktree);
         client.add_entity_request_handler(Self::handle_get_head_sha);
         client.add_entity_request_handler(Self::handle_edit_ref);
@@ -2703,6 +2704,23 @@ impl GitStore {
         repository_handle
             .update(&mut cx, |repository_handle, _| {
                 repository_handle.repair_worktrees()
+            })
+            .await??;
+
+        Ok(proto::Ack {})
+    }
+
+    async fn handle_prune_worktrees(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitPruneWorktrees>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+
+        repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle.prune_worktrees()
             })
             .await??;
 
@@ -6853,6 +6871,30 @@ impl Repository {
                                 repository_id: id.to_proto(),
                                 path: path.to_string_lossy().to_string(),
                                 force,
+                            })
+                            .await?;
+
+                        Ok(())
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn prune_worktrees(&mut self) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        self.send_job(
+            Some("git worktree prune".into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.prune_worktrees().await
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        client
+                            .request(proto::GitPruneWorktrees {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
                             })
                             .await?;
 

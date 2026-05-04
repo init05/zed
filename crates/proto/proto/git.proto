@@ -656,6 +656,11 @@ message GitRemoveWorktree {
   bool force = 4;
 }
 
+message GitPruneWorktrees {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+}
+
 message GitRenameWorktree {
   uint64 project_id = 1;
   uint64 repository_id = 2;

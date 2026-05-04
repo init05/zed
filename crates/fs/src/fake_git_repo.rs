@@ -733,6 +733,54 @@ impl GitRepository for FakeGitRepository {
         .boxed()
     }
 
+    fn prune_worktrees(&self) -> BoxFuture<'_, Result<()>> {
+        let fs = self.fs.clone();
+        let executor = self.executor.clone();
+        let common_dir_path = self.common_dir_path.clone();
+        async move {
+            executor.simulate_random_delay().await;
+
+            let worktrees_dir = common_dir_path.join("worktrees");
+            let mut entries = match fs.read_dir(&worktrees_dir).await {
+                Ok(entries) => entries,
+                Err(_) => return Ok(()),
+            };
+            use futures::StreamExt;
+            let mut to_remove: Vec<PathBuf> = Vec::new();
+            while let Some(Ok(entry_path)) = entries.next().await {
+                let gitdir_content = match fs.load(&entry_path.join("gitdir")).await {
+                    Ok(content) => content,
+                    Err(_) => continue,
+                };
+                let worktree_dot_git = PathBuf::from(gitdir_content.trim());
+                let worktree_dir = worktree_dot_git
+                    .parent()
+                    .map(PathBuf::from)
+                    .unwrap_or_default();
+                if fs.metadata(&worktree_dir).await?.is_none() {
+                    to_remove.push(entry_path);
+                }
+            }
+
+            for entry_path in to_remove {
+                fs.remove_dir(
+                    &entry_path,
+                    RemoveOptions {
+                        recursive: true,
+                        ignore_if_not_exists: true,
+                    },
+                )
+                .await?;
+            }
+
+            // Notify the scanner that the .git directory changed.
+            fs.with_git_state(&common_dir_path, true, |_| {})?;
+
+            Ok(())
+        }
+        .boxed()
+    }
+
     fn remove_worktree(&self, path: PathBuf, _force: bool) -> BoxFuture<'_, Result<()>> {
         let fs = self.fs.clone();
         let executor = self.executor.clone();

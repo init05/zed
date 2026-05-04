@@ -815,6 +815,11 @@ pub trait GitRepository: Send + Sync {
 
     fn remove_worktree(&self, path: PathBuf, force: bool) -> BoxFuture<'_, Result<()>>;
 
+    /// Runs `git worktree prune`, which removes admin entries in
+    /// `$GIT_DIR/worktrees/` for worktrees whose working directories no longer
+    /// exist. Idempotent — safe to call when there's nothing to prune.
+    fn prune_worktrees(&self) -> BoxFuture<'_, Result<()>>;
+
     fn rename_worktree(&self, old_path: PathBuf, new_path: PathBuf) -> BoxFuture<'_, Result<()>>;
 
     fn reset(
@@ -1921,6 +1926,18 @@ impl GitRepository for RealGitRepository {
                 }
                 args.push("--".into());
                 args.push(path.as_os_str().into());
+                git_binary?.run(&args).await?;
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn prune_worktrees(&self) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary();
+
+        self.executor
+            .spawn(async move {
+                let args: Vec<OsString> = vec!["worktree".into(), "prune".into()];
                 git_binary?.run(&args).await?;
                 anyhow::Ok(())
             })
