@@ -5580,6 +5580,340 @@ async fn test_restore_worktree_rolls_back_backup_on_failure(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+async fn test_restore_worktree_round_trips_committed_and_uncommitted_content(
+    cx: &mut TestAppContext,
+) {
+    // End-to-end happy-path smoke test for `restore_worktree_via_git`:
+    // plant a checkpoint, tear the worktree directory down to simulate
+    // archival, then call the restore and confirm the captured tree is
+    // reinstated.
+    //
+    // FakeFs limitation: for a linked worktree opened via a `.git` gitfile,
+    // the fake's `create_archive_checkpoint` captures
+    // `repository_dir_path.parent()` (see `crates/fs/src/fake_git_repo.rs`),
+    // which resolves to `<main_repo>/.git/worktrees` — NOT the working
+    // tree at the linked worktree's path. As a result, `restore_archive_
+    // checkpoint` only round-trips the contents of
+    // `<main_repo>/.git/worktrees`, not anything written to the working
+    // directory. We therefore plant our marker inside the captured
+    // location (the linked worktree's `worktrees/<name>` registration
+    // directory) so we have something concrete to assert was actually
+    // moved through the checkpoint pipeline. We still write some user-
+    // facing files to the working tree before checkpointing (and assert
+    // the worktree path itself is recreated) to show that those don't
+    // crash the round-trip even though their contents aren't captured by
+    // the fake.
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {
+                "worktrees": {
+                    "feature-rt": {
+                        "commondir": "../../",
+                        "HEAD": "ref: refs/heads/feature-rt",
+                    },
+                },
+            },
+            "src": {},
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        "/wt-feature-rt",
+        serde_json::json!({
+            ".git": "gitdir: /project/.git/worktrees/feature-rt",
+            "src": {},
+        }),
+    )
+    .await;
+    fs.add_linked_worktree_for_repo(
+        Path::new("/project/.git"),
+        false,
+        git::repository::Worktree {
+            path: PathBuf::from("/wt-feature-rt"),
+            ref_name: Some("refs/heads/feature-rt".into()),
+            sha: "original-sha".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    let worktree_project =
+        project::Project::test(fs.clone(), ["/wt-feature-rt".as_ref()], cx).await;
+    main_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+    worktree_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, _cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
+    multi_workspace.update_in(_cx, |mw, window, cx| {
+        mw.test_add_workspace(worktree_project.clone(), window, cx)
+    });
+
+    // Working-tree files. The fake doesn't round-trip these, but writing
+    // them and then asserting the restore still completes proves the
+    // function tolerates pre-checkpoint content in the working tree.
+    fs.write(Path::new("/wt-feature-rt/staged.txt"), b"staged contents")
+        .await
+        .expect("writing staged.txt should succeed");
+    fs.write(
+        Path::new("/wt-feature-rt/src/nested.txt"),
+        b"nested contents",
+    )
+    .await
+    .expect("writing src/nested.txt should succeed");
+
+    // Marker inside the captured location. This is the file we'll
+    // actually assert round-trips, since it sits inside what the fake's
+    // `create_archive_checkpoint` snapshots.
+    fs.write(
+        Path::new("/project/.git/worktrees/feature-rt/marker.txt"),
+        b"checkpoint marker",
+    )
+    .await
+    .expect("writing checkpoint marker should succeed");
+
+    let wt_repo = worktree_project.read_with(cx, |project, cx| {
+        project.repositories(cx).values().next().unwrap().clone()
+    });
+    let (staged_hash, unstaged_hash) = cx
+        .update(|cx| wt_repo.update(cx, |repo, _| repo.create_archive_checkpoint()))
+        .await
+        .expect("create_archive_checkpoint task should not be canceled")
+        .expect("create_archive_checkpoint should succeed");
+
+    // Simulate the archive having torn down the worktree directory.
+    fs.remove_dir(
+        Path::new("/wt-feature-rt"),
+        fs::RemoveOptions {
+            recursive: true,
+            ignore_if_not_exists: false,
+        },
+    )
+    .await
+    .expect("removing the worktree dir should succeed");
+
+    // Also clobber the captured marker so a successful restore is the
+    // only thing that could put it back.
+    fs.remove_file(
+        Path::new("/project/.git/worktrees/feature-rt/marker.txt"),
+        fs::RemoveOptions {
+            recursive: false,
+            ignore_if_not_exists: false,
+        },
+    )
+    .await
+    .expect("removing checkpoint marker should succeed");
+
+    let result = cx
+        .spawn(|mut cx| async move {
+            agent_ui::thread_worktree_archive::restore_worktree_via_git(
+                &agent_ui::thread_metadata_store::ArchivedGitWorktree {
+                    id: 1,
+                    worktree_path: PathBuf::from("/wt-feature-rt"),
+                    main_repo_path: PathBuf::from("/project"),
+                    branch_name: Some("feature-rt".to_string()),
+                    staged_commit_hash: staged_hash,
+                    unstaged_commit_hash: unstaged_hash,
+                    original_commit_hash: "original-sha".to_string(),
+                },
+                None,
+                &mut cx,
+            )
+            .await
+        })
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "restore should succeed for a clean round-trip: {:?}",
+        result.err()
+    );
+
+    // The marker we planted in the captured location must come back
+    // with its original contents — this is the actual round-trip
+    // assertion `restore_archive_checkpoint` is exercising in the fake.
+    let marker = fs
+        .load(Path::new("/project/.git/worktrees/feature-rt/marker.txt"))
+        .await
+        .expect("checkpoint marker must be restored");
+    assert_eq!(marker, "checkpoint marker");
+
+    // The worktree directory itself must exist after restore (created
+    // by `create_worktree_detached`), and its `.git` gitfile must be
+    // present so the path is a usable linked worktree again.
+    assert!(
+        fs.metadata(Path::new("/wt-feature-rt"))
+            .await
+            .expect("metadata for worktree path must succeed")
+            .is_some(),
+        "worktree directory should exist after restore"
+    );
+    assert!(
+        fs.metadata(Path::new("/wt-feature-rt/.git"))
+            .await
+            .expect("metadata for worktree .git must succeed")
+            .is_some(),
+        "worktree .git gitfile should exist after restore"
+    );
+
+    // No backup directory should remain on success.
+    let leftover_backup = fs.directories(true).into_iter().find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".zed-restore-backup-"))
+    });
+    assert!(
+        leftover_backup.is_none(),
+        "backup directory should be cleaned up after a successful round-trip, found: {leftover_backup:?}"
+    );
+}
+
+#[gpui::test]
+async fn test_restore_worktree_rolls_back_when_create_worktree_detached_fails(
+    cx: &mut TestAppContext,
+) {
+    // Exercises the rollback path that runs when `create_worktree_detached`
+    // itself fails (the early failure branch in `restore_worktree_via_git`,
+    // before any branch / checkpoint operations have run). We force the
+    // failure with `FakeFs::set_create_worktree_error`, which makes the
+    // fake's `create_worktree` bail before producing any side effects.
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {
+                "worktrees": {
+                    "feature-create-fail": {
+                        "commondir": "../../",
+                        "HEAD": "ref: refs/heads/feature-create-fail",
+                    },
+                },
+            },
+            "src": {},
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        "/wt-feature-create-fail",
+        serde_json::json!({
+            ".git": "gitdir: /project/.git/worktrees/feature-create-fail",
+            "src": {},
+        }),
+    )
+    .await;
+    fs.add_linked_worktree_for_repo(
+        Path::new("/project/.git"),
+        false,
+        git::repository::Worktree {
+            path: PathBuf::from("/wt-feature-create-fail"),
+            ref_name: Some("refs/heads/feature-create-fail".into()),
+            sha: "original-sha".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    let worktree_project =
+        project::Project::test(fs.clone(), ["/wt-feature-create-fail".as_ref()], cx).await;
+    main_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+    worktree_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, _cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
+    multi_workspace.update_in(_cx, |mw, window, cx| {
+        mw.test_add_workspace(worktree_project.clone(), window, cx)
+    });
+
+    // Take a valid checkpoint so the bogus-SHA path isn't what's failing.
+    let wt_repo = worktree_project.read_with(cx, |project, cx| {
+        project.repositories(cx).values().next().unwrap().clone()
+    });
+    let (staged_hash, unstaged_hash) = cx
+        .update(|cx| wt_repo.update(cx, |repo, _| repo.create_archive_checkpoint()))
+        .await
+        .expect("create_archive_checkpoint task should not be canceled")
+        .expect("create_archive_checkpoint should succeed");
+
+    // Sentinel content that the rollback must put back.
+    fs.write(
+        Path::new("/wt-feature-create-fail/sentinel.txt"),
+        b"important user data",
+    )
+    .await
+    .expect("writing sentinel.txt should succeed");
+
+    // Force `create_worktree_detached` to fail when the restore tries it.
+    fs.set_create_worktree_error(
+        Path::new("/project/.git"),
+        Some("simulated create_worktree failure".to_string()),
+    );
+
+    let result = cx
+        .spawn(|mut cx| async move {
+            agent_ui::thread_worktree_archive::restore_worktree_via_git(
+                &agent_ui::thread_metadata_store::ArchivedGitWorktree {
+                    id: 1,
+                    worktree_path: PathBuf::from("/wt-feature-create-fail"),
+                    main_repo_path: PathBuf::from("/project"),
+                    branch_name: Some("feature-create-fail".to_string()),
+                    staged_commit_hash: staged_hash,
+                    unstaged_commit_hash: unstaged_hash,
+                    original_commit_hash: "original-sha".to_string(),
+                },
+                None,
+                &mut cx,
+            )
+            .await
+        })
+        .await;
+
+    assert!(
+        result.is_err(),
+        "restore should fail when create_worktree_detached fails",
+    );
+
+    // The pre-existing sentinel must be back at the original path.
+    let sentinel_contents = fs
+        .load(Path::new("/wt-feature-create-fail/sentinel.txt"))
+        .await
+        .expect("sentinel file must be restored from the backup");
+    assert_eq!(
+        sentinel_contents, "important user data",
+        "sentinel content must match what was on disk before the restore",
+    );
+
+    // No backup directory should remain anywhere on the fake fs.
+    let leftover_backup = fs.directories(true).into_iter().find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".zed-restore-backup-"))
+    });
+    assert!(
+        leftover_backup.is_none(),
+        "backup directory should be cleaned up after a create_worktree rollback, found: {leftover_backup:?}"
+    );
+}
+
+#[gpui::test]
 async fn test_restore_worktree_thread_uses_main_repo_project_group_key(cx: &mut TestAppContext) {
     // Activating an archived linked worktree thread whose directory has
     // been deleted should reuse the existing main repo workspace, not
