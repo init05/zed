@@ -571,8 +571,9 @@ pub async fn rollback_persist(archived_worktree_id: i64, root: &RootPlan, cx: &m
 ///
 /// **Destructive**: the final step (`restore_archive_checkpoint`) clobbers the
 /// working directory unconditionally via `git read-tree --reset -u`. Any
-/// pre-existing entry at `worktree_path` is moved aside into a sibling
-/// `zed-restore-backup-<uuid>` directory before the rest of the destructive
+/// pre-existing entry at `worktree_path` is moved aside into a
+/// `zed-restore-backup-<uuid>` directory under the system temp directory
+/// before the rest of the destructive
 /// work runs. If a later step fails, the backup is moved back over
 /// `worktree_path` so the user does not lose their content. On success the
 /// backup directory is deleted.
@@ -629,18 +630,8 @@ pub async fn restore_worktree_via_git(
     }
 
     let backup = if path_exists {
-        // Place the backup directory next to `worktree_path` so the rename
-        // stays on the same filesystem and is therefore atomic. If the
-        // worktree path has no parent (e.g. it is the filesystem root),
-        // there is nowhere to put the backup and we have to bail out
-        // before doing anything destructive.
-        let parent = worktree_path.parent().with_context(|| {
-            format!(
-                "worktree path '{}' has no parent directory to host a rollback backup",
-                worktree_path.display()
-            )
-        })?;
-        let backup_dir = parent.join(format!("zed-restore-backup-{}", uuid::Uuid::new_v4()));
+        let backup_dir =
+            std::env::temp_dir().join(format!("zed-restore-backup-{}", uuid::Uuid::new_v4()));
         app_state
             .fs
             .create_dir(&backup_dir)
