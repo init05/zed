@@ -2865,7 +2865,7 @@ impl Sidebar {
                 // archived state stays consistent.
                 let mut paths_to_overwrite: Vec<PathBuf> = Vec::new();
                 for row in &archived_worktrees {
-                    match thread_worktree_archive::restore_would_overwrite(row, &mut *cx).await {
+                    match thread_worktree_archive::restore_would_overwrite(row, metadata.remote_connection.as_ref(), &mut *cx).await {
                         Ok(true) => {
                             paths_to_overwrite.push(row.worktree_path.clone());
                         }

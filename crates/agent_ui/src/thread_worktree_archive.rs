@@ -572,6 +572,9 @@ pub async fn restore_worktree_via_git(
     remote_connection: Option<&RemoteConnectionOptions>,
     cx: &mut AsyncApp,
 ) -> Result<PathBuf> {
+    if remote_connection.is_some() {
+        anyhow::bail!("restoring archived worktrees on remote machines is not yet supported");
+    }
     let app_state = current_app_state(cx).context("no app state available")?;
     let worktree_path = &row.worktree_path;
 
@@ -937,7 +940,14 @@ async fn rollback_backup(
 /// Callers must invoke this **before** [`restore_worktree_via_git`] and prompt
 /// the user for confirmation if it returns `true`, since the restore will
 /// otherwise destroy that content.
-pub async fn restore_would_overwrite(row: &ArchivedGitWorktree, cx: &mut AsyncApp) -> Result<bool> {
+pub async fn restore_would_overwrite(
+    row: &ArchivedGitWorktree,
+    remote_connection: Option<&RemoteConnectionOptions>,
+    cx: &mut AsyncApp,
+) -> Result<bool> {
+    if remote_connection.is_some() {
+        anyhow::bail!("restoring archived worktrees on remote machines is not yet supported");
+    }
     let app_state = current_app_state(cx).context("no app state available")?;
     worktree_path_has_content(app_state.fs.as_ref(), &row.worktree_path).await
 }
