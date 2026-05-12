@@ -3196,6 +3196,18 @@ impl Sidebar {
 
                 // Restore pass: user has confirmed (or there was nothing to
                 // confirm). Do the destructive restore for every worktree.
+                //
+                // Importantly, we do NOT delete each archived worktree's DB
+                // record (via `cleanup_archived_worktree_record`) inside
+                // this loop. If we did, a later worktree's failure would
+                // strand the thread: the successful rows would have no
+                // archived metadata left to retry from, leaving on-disk
+                // worktrees orphaned and the thread permanently broken.
+                // Instead, cleanup happens only once every worktree has
+                // restored successfully; if any fails, all archive records
+                // remain intact and the user can retry the whole thread
+                // (each `restore_worktree_via_git` call is idempotent for a
+                // path that already matches its checkpoint).
                 let mut path_replacements: Vec<(PathBuf, PathBuf)> = Vec::new();
                 for row in &archived_worktrees {
                     let overwrite_policy =
@@ -3213,12 +3225,6 @@ impl Sidebar {
                     .await
                     {
                         Ok(restored_path) => {
-                            thread_worktree_archive::cleanup_archived_worktree_record(
-                                row,
-                                metadata.remote_connection.as_ref(),
-                                &mut *cx,
-                            )
-                            .await;
                             path_replacements.push((row.worktree_path.clone(), restored_path));
                         }
                         Err(error) => {
@@ -3248,6 +3254,19 @@ impl Sidebar {
                     }
                 }
 
+                // Every restore succeeded; only now is it safe to drop the
+                // archive records. `cleanup_archived_worktree_record`
+                // swallows its own errors (best-effort), so a cleanup
+                // failure leaks a DB row but doesn't break the thread.
+                for row in &archived_worktrees {
+                    thread_worktree_archive::cleanup_archived_worktree_record(
+                        row,
+                        metadata.remote_connection.as_ref(),
+                        &mut *cx,
+                    )
+                    .await;
+                }
+
                 if !path_replacements.is_empty() {
                     cx.update(|_window, cx| {
                         store.update(cx, |store, cx| {
@@ -3258,30 +3277,49 @@ impl Sidebar {
                     let updated_metadata =
                         cx.update(|_window, cx| store.read(cx).entry(thread_id).cloned())?;
 
-                    if let Some(updated_metadata) = updated_metadata {
-                        let new_paths = updated_metadata.folder_paths().clone();
-                        let key = ProjectGroupKey::from_worktree_paths(
-                            &updated_metadata.worktree_paths,
-                            updated_metadata.remote_connection.clone(),
-                        );
-
-                        cx.update(|_window, cx| {
-                            store.update(cx, |store, cx| {
-                                store.unarchive(updated_metadata.thread_id, cx);
-                            });
-                        })?;
-
-                        this.update_in(cx, |this, window, cx| {
-                            this.restoring_tasks.remove(&thread_id);
-                            this.open_workspace_and_activate_thread(
-                                updated_metadata,
-                                new_paths,
-                                &key,
-                                window,
-                                cx,
+                    match updated_metadata {
+                        Some(updated_metadata) => {
+                            let new_paths = updated_metadata.folder_paths().clone();
+                            let key = ProjectGroupKey::from_worktree_paths(
+                                &updated_metadata.worktree_paths,
+                                updated_metadata.remote_connection.clone(),
                             );
-                            this.show_thread_list(window, cx);
-                        })?;
+
+                            cx.update(|_window, cx| {
+                                store.update(cx, |store, cx| {
+                                    store.unarchive(updated_metadata.thread_id, cx);
+                                });
+                            })?;
+
+                            this.update_in(cx, |this, window, cx| {
+                                this.restoring_tasks.remove(&thread_id);
+                                this.open_workspace_and_activate_thread(
+                                    updated_metadata,
+                                    new_paths,
+                                    &key,
+                                    window,
+                                    cx,
+                                );
+                                this.show_thread_list(window, cx);
+                            })?;
+                        }
+                        None => {
+                            // The thread was removed from the store between
+                            // the restore loop and this lookup (e.g. another
+                            // window deleted it). The on-disk restore has
+                            // already succeeded, but there's nothing left
+                            // here to activate. Make sure the per-window
+                            // "restoring..." state is cleared so the
+                            // spinner doesn't get stuck.
+                            log::warn!(
+                                "Thread {thread_id:?} disappeared from the store mid-restore; \
+                                 on-disk worktrees were restored but the thread can't be activated."
+                            );
+                            this.update_in(cx, |this, _window, cx| {
+                                this.finish_restore_ui(thread_id, &weak_archive_view, cx);
+                            })
+                            .ok();
+                        }
                     }
                 }
 
