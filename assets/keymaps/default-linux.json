@@ -1196,6 +1196,12 @@
     },
   },
   {
+    "context": "FileFinder > Picker > Editor && end_of_input",
+    "bindings": {
+      "right": "file_finder::OpenWithoutDismiss",
+    },
+  },
+  {
     "context": "RecentProjects || (RecentProjects > Picker > Editor)",
     "bindings": {
       "ctrl-k": "recent_projects::ToggleActionsMenu",
