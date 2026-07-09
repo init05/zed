@@ -1624,6 +1624,7 @@ impl PickerDelegate for FileFinderDelegate {
         cx: &mut Context<Picker<Self>>,
     ) -> Option<AnyElement> {
         let focus_handle = self.focus_handle.clone();
+        let focus_handle_for_keep_open = self.focus_handle.clone();
         let including_ignored = self.include_ignored == Some(true);
         // Clicking includes ignored files unless they're already included, in
         // which case it excludes them again (see `handle_toggle_ignored`).
@@ -1632,6 +1633,20 @@ impl PickerDelegate for FileFinderDelegate {
         } else {
             "Include Ignored Files"
         };
+
+        let keep_open_button = IconButton::new("open-without-dismiss", IconName::ArrowRight)
+            .icon_size(IconSize::Small)
+            .tooltip(move |_window, cx| {
+                Tooltip::for_action_in(
+                    "Open Without Closing",
+                    &OpenWithoutDismiss,
+                    &focus_handle_for_keep_open,
+                    cx,
+                )
+            })
+            .on_click(|_, window, cx| {
+                window.dispatch_action(OpenWithoutDismiss.boxed_clone(), cx)
+            });
 
         let filter_button = IconButton::new("filter-ignored", IconName::Sliders)
             .icon_size(IconSize::Small)
@@ -1648,6 +1663,7 @@ impl PickerDelegate for FileFinderDelegate {
         Some(
             h_flex()
                 .gap_1()
+                .child(keep_open_button)
                 .child(filter_button)
                 .children(picker::parts::project_scan_indicator(
                     self.latest_search_query.is_some(),
